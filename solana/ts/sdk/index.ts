@@ -1,4 +1,6 @@
-import { type ChainName, toChainId, coalesceChainId, type ChainId, SignedVaa, parseVaa } from '@certusone/wormhole-sdk'
+import { type ChainName, toChainId, coalesceChainId, type ChainId, SignedVaa } from '@certusone/wormhole-sdk'
+import { serializeLayout, toChainId as SDKv2toChainId } from "@wormhole-foundation/sdk-base";
+import { deserialize } from "@wormhole-foundation/sdk-definitions";
 import { derivePostedVaaKey, getWormholeDerivedAccounts } from '@certusone/wormhole-sdk/lib/cjs/solana/wormhole'
 import { BN, translateError, type IdlAccounts, type Program } from '@coral-xyz/anchor'
 import { associatedAddress } from '@coral-xyz/anchor/dist/cjs/utils/token'
@@ -13,18 +15,24 @@ import {
 } from '@solana/web3.js'
 import { Keccak } from 'sha3'
 import { type ExampleNativeTokenTransfers as Idl } from '../../target/types/example_native_token_transfers'
-import { ManagerMessage } from './payloads/common'
-import { NativeTokenTransfer } from './payloads/transfers'
-import { WormholeEndpointMessage } from './payloads/wormhole'
+import {
+  managerMessageLayout,
+  ManagerMessage,
+  nativeTokenTransferLayout,
+} from './payloads'
 import { BPF_LOADER_UPGRADEABLE_PROGRAM_ID, programDataAddress } from './utils'
 import * as splToken from '@solana/spl-token';
 
-export { NormalizedAmount } from './normalized_amount'
-export { EndpointMessage, ManagerMessage } from './payloads/common'
-export { NativeTokenTransfer } from './payloads/transfers'
-export { WormholeEndpointMessage } from './payloads/wormhole'
-
 export * from './utils/wormhole'
+
+export const managerMessageNTTLayout = managerMessageLayout(nativeTokenTransferLayout);
+export type ManagerMessageNTT = ManagerMessage<typeof nativeTokenTransferLayout>;
+
+//TODO export additional stuff that users might need
+export {
+  NormalizedAmount,
+  WormholeNativeTokenTransfer,
+} from './payloads'
 
 // This is a workaround for the fact that the anchor idl doesn't support generics
 // yet. This type is used to remove the generics from the idl types.
@@ -90,9 +98,9 @@ export class NTT {
     return this.derive_pda([Buffer.from('inbox_rate_limit'), new BN(chainId).toBuffer('be', 2)])
   }
 
-  inboxItemAccountAddress(chain: ChainName | ChainId, managerMessage: ManagerMessage<NativeTokenTransfer>): PublicKey {
+  inboxItemAccountAddress(chain: ChainName | ChainId, managerMessage: ManagerMessageNTT): PublicKey {
     const chainId = coalesceChainId(chain)
-    const serialized = ManagerMessage.serialize(managerMessage, NativeTokenTransfer.serialize)
+    const serialized = Buffer.from(serializeLayout(managerMessageNTTLayout, managerMessage))
     const hasher = new Keccak(256)
     hasher.update(new BN(chainId).toBuffer('be', 2))
     hasher.update(serialized)
@@ -397,7 +405,7 @@ export class NTT {
   async createReleaseInboundMintInstruction(args: {
     payer: PublicKey
     chain: ChainName | ChainId
-    managerMessage: ManagerMessage<NativeTokenTransfer>
+    managerMessage: ManagerMessageNTT
     revertOnDelay: boolean
     recipient?: PublicKey
     config?: Config
@@ -433,7 +441,7 @@ export class NTT {
   async releaseInboundMint(args: {
     payer: Keypair
     chain: ChainName | ChainId
-    managerMessage: ManagerMessage<NativeTokenTransfer>
+    managerMessage: ManagerMessageNTT
     revertOnDelay: boolean
     config?: Config
   }): Promise<void> {
@@ -456,7 +464,7 @@ export class NTT {
   async createReleaseInboundUnlockInstruction(args: {
     payer: PublicKey
     chain: ChainName | ChainId
-    managerMessage: ManagerMessage<NativeTokenTransfer>
+    managerMessage: ManagerMessageNTT
     revertOnDelay: boolean
     recipient?: PublicKey
     config?: Config
@@ -493,7 +501,7 @@ export class NTT {
   async releaseInboundUnlock(args: {
     payer: Keypair
     chain: ChainName | ChainId
-    managerMessage: ManagerMessage<NativeTokenTransfer>
+    managerMessage: ManagerMessageNTT
     revertOnDelay: boolean
     config?: Config
   }): Promise<void> {
@@ -587,14 +595,11 @@ export class NTT {
       throw new Error('Contract is paused')
     }
 
-    const parsedVaa = parseVaa(args.vaa)
-    const managerMessage =
-      WormholeEndpointMessage.deserialize(
-        parsedVaa.payload, a => ManagerMessage.deserialize(a, a => a)
-      ).managerPayload
+    const wormholeNTT = deserialize("NTT:Transfer", args.vaa)
+    const managerMessage = wormholeNTT.payload.managerPayload
     // NOTE: we do an 'as ChainId' cast here, which is generally unsafe.
     // TODO: explain why this is fine here
-    const chainId = parsedVaa.emitterChain as ChainId
+    const chainId = SDKv2toChainId(wormholeNTT.emitterChain) as ChainId
 
     const endpointSibling = this.endpointSiblingAccountAddress(chainId)
 
@@ -602,7 +607,7 @@ export class NTT {
       payer: args.payer,
       config: this.configAccountAddress(),
       sibling: endpointSibling,
-      vaa: derivePostedVaaKey(this.wormholeId, parseVaa(args.vaa).hash),
+      vaa: derivePostedVaaKey(this.wormholeId, Buffer.from(wormholeNTT.hash)),
       endpointMessage: this.endpointMessageAccountAddress(
         chainId,
         new BN(managerMessage.sequence.toString())
@@ -622,17 +627,11 @@ export class NTT {
       throw new Error('Contract is paused')
     }
 
-    const parsedVaa = parseVaa(args.vaa)
-    const endpointMessage =
-      WormholeEndpointMessage.deserialize(
-        parsedVaa.payload, a => ManagerMessage.deserialize(
-          a, NativeTokenTransfer.deserialize
-        )
-      )
-    const managerMessage = endpointMessage.managerPayload
+    const wormholeNTT = deserialize("NTT:Transfer", args.vaa)
+    const managerMessage = wormholeNTT.payload.managerPayload
     // NOTE: we do an 'as ChainId' cast here, which is generally unsafe.
     // TODO: explain why this is fine here
-    const chainId = parsedVaa.emitterChain as ChainId
+    const chainId = SDKv2toChainId(wormholeNTT.emitterChain) as ChainId
 
     const managerSibling = this.siblingAccountAddress(chainId)
     const inboxRateLimit = this.inboxRateLimitAccountAddress(chainId)
@@ -673,14 +672,11 @@ export class NTT {
       payer: args.payer.publicKey
     }
 
-    const parsedVaa = parseVaa(args.vaa)
-
-    const managerMessage =
-      WormholeEndpointMessage.deserialize(
-        parsedVaa.payload, a => ManagerMessage.deserialize(a, NativeTokenTransfer.deserialize)
-      ).managerPayload
+    const wormholeNTT = deserialize("NTT:Transfer", args.vaa)
+    const managerMessage = wormholeNTT.payload.managerPayload
+    // NOTE: we do an 'as ChainId' cast here, which is generally unsafe.
     // TODO: explain why this is fine here
-    const chainId = parsedVaa.emitterChain as ChainId
+    const chainId = SDKv2toChainId(wormholeNTT.emitterChain) as ChainId
 
     // Here we create a transaction with three instructions:
     // 1. receive wormhole messsage (vaa)
@@ -750,7 +746,7 @@ export class NTT {
     return (await this.getConfig(config)).tokenProgram
   }
 
-  async getInboxItem(chain: ChainName | ChainId, managerMessage: ManagerMessage<NativeTokenTransfer>): Promise<InboxItem> {
+  async getInboxItem(chain: ChainName | ChainId, managerMessage: ManagerMessageNTT): Promise<InboxItem> {
     return await this.program.account.inboxItem.fetch(this.inboxItemAccountAddress(chain, managerMessage))
   }
 
